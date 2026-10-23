@@ -45,6 +45,7 @@ import { type CatalogEntry, parseCatalog } from '../catalog/catalog-data'
 import { CatalogSwitch } from '../catalog/catalog-switch'
 import { TOOLSETS_QUERY_KEY } from '../toolsets/toolsets-data'
 
+import { PluginFolderAccess } from './plugin-folder-access'
 import { mergePluginPackages, type PackageKind, type PluginPackage } from './plugin-packages'
 import { runPluginUpdate } from './plugin-update'
 
@@ -275,7 +276,7 @@ function PackageRow({
   request: GatewayRequest
   onAgentToggle: (row: AgentPluginRow, enable: boolean) => void
   onAgentUpdate: (row: AgentPluginRow) => void
-  onAgentRemove: (row: AgentPluginRow) => void
+  onAgentRemove: (row: AgentPluginRow, desktop: null | PluginRecord) => void
   onDesktopRemove: (record: PluginRecord) => void
 }) {
   const { t } = useI18n()
@@ -435,6 +436,8 @@ function PackageRow({
           </span>
         </div>
 
+        <PluginFolderAccess name={pkg.name} plugin={desktop} />
+
         {/* The two halves. Desktop is app-level and reads the same whichever
           profile is selected; Agent follows the selector. A half the package
           lacks shows a dash; a half it has but which is missing on this side
@@ -517,7 +520,7 @@ function PackageRow({
             disabled={busy}
             name={pkg.name}
             note={p.uninstallTip(pkg.name, scopeLabel)}
-            onUninstall={() => onAgentRemove(agent)}
+            onUninstall={() => onAgentRemove(agent, desktop)}
           />
         ) : (
           desktop &&
@@ -683,7 +686,7 @@ export const PluginsTab = memo(function PluginsTab({
   const isInstalled = (entry: CatalogEntry) => packageById.has(entry.id)
 
   const handleAgentRemove = useCallback(
-    (row: AgentPluginRow) => {
+    (row: AgentPluginRow, desktop: null | PluginRecord) => {
       void confirm({
         confirmLabel: p.uninstall,
         description: p.uninstallConfirmBody(row.name, label),
@@ -696,6 +699,12 @@ export const PluginsTab = memo(function PluginsTab({
 
         if (await removeAgentPlugin(requestGateway, row.name, p.uninstallFailed(row.name), scope)) {
           notify({ kind: 'success', message: p.uninstalled(row.name) })
+
+          // A reinstall under the same id must ask for its folders again.
+          if (desktop) {
+            void window.hermesDesktop?.pluginFiles?.revoke(desktop.id)
+          }
+
           // Prunes the app-level desktop half whose source package just went away.
           void rescanAll(requestGateway, scope)
         }

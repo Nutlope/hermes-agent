@@ -1008,6 +1008,11 @@ export async function uninstallDiskPlugin(pluginId: string): Promise<{ ok: boole
 
   retireDiskPlugin(file, record)
 
+  // A reinstall under the same id must ask for its folders again (ctx.files).
+  if (record.id) {
+    void window.hermesDesktop?.pluginFiles?.revoke(record.id)
+  }
+
   return { ok: true }
 }
 

@@ -29,10 +29,12 @@ import { $petActive } from '@/store/pet'
 import { clearPetMessages, type PetSayOptions, sayPetMessage } from '@/store/pet-plugin-messages'
 
 import { type GatewayEventListener, onGatewayEvent } from './events'
+import { createPluginFiles, type PluginFiles } from './plugin-files'
 import { $pluginRecords } from './plugins-store'
 import { registry } from './registry'
 import { type PluginSettingsPage, settingsPageContribution } from './settings-pages'
 
+export type { PluginFileEntry, PluginFiles, PluginFilesResult, PluginFolder } from './plugin-files'
 export type { PluginSettingsPage, PluginSettingsSubpage } from './settings-pages'
 import type { Contribution } from './types'
 
@@ -173,6 +175,11 @@ export interface PluginContext {
   listActions: () => PluginAppActionInfo[]
   /** Plugin-scoped persistence. */
   storage: PluginStorage
+  /** Folder-scoped file access: this plugin's own data folder plus folders
+   *  the user grants it through the app's picker, by relative path. The app
+   *  checks every call; nothing outside those folders (or inside Hermes'
+   *  own data) is reachable. Feature-detect on older hosts: `ctx.files?.…`. */
+  files: PluginFiles
   /** Plugin-scoped i18n: ship + register locale bundles under this plugin,
    *  resolved against the app's active locale — no core `en.ts` edit. */
   i18n: PluginI18n
@@ -370,6 +377,7 @@ export function createPluginContext(pluginId: string, onDispose?: (dispose: () =
     runAction: id => runPluginAppAction(pluginId, id),
     listActions: listPluginAppActions,
     storage: createPluginStorage(pluginId),
+    files: createPluginFiles(pluginId),
     i18n: createPluginI18n(pluginId, track)
   }
 }
