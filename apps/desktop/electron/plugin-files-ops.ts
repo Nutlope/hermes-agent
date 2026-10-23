@@ -1,7 +1,9 @@
 // The operations behind `ctx.files` (plugin-files.ts owns grants and path
 // resolution). Each op gets a target already resolved inside its folder and
 // re-applies the per-op rules: size caps, sensitive names, no op on the folder
-// itself, O_EXCL creation.
+// itself, regular files only, O_EXCL creation. Reads and writes go through a
+// handle whose identity (dev/ino) must match the file that was checked, so a
+// swap between the check and the open is refused rather than followed.
 
 import fs from 'node:fs'
 import path from 'node:path'
@@ -12,6 +14,14 @@ import type { PluginFilesErrorCode, PluginFilesFailure, PluginFilesRequest, Plug
 const TEXT_MAX_BYTES = 4 * 1024 * 1024
 const DATA_URL_MAX_BYTES = 16 * 1024 * 1024
 const LIST_MAX_ENTRIES = 10_000
+const READ_CHUNK_BYTES = 1024 * 1024
+// Folders whose contents are keys; renaming one away from its name would put
+// those keys out of reach of the name-based sensitive-file rules.
+const SENSITIVE_DIRS = new Set(['.aws', '.gnupg', '.ssh'])
+// Non-blocking so a FIFO or device that slipped in cannot park a main-process
+// worker; no-follow so a link swapped in for an existing file is refused.
+const READ_FLAGS = fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0)
+const UPDATE_FLAGS = fs.constants.O_RDWR | (fs.constants.O_NONBLOCK ?? 0) | (fs.constants.O_NOFOLLOW ?? 0)
 
 const IMAGE_MIME: Record<string, string> = {
   '.avif': 'image/avif',
@@ -66,11 +76,120 @@ export async function realpathOrNull(target: string): Promise<null | string> {
   }
 }
 
-export const refuseSensitive = (target: string) => {
-  const sensitive = sensitiveFileBlockReason(target)
+// The app's sensitive-file rules, checked on the name as given and as macOS
+// and Windows match it (Unicode case folding: `id_rſa` opens `id_rsa` there).
+export function sensitiveReason(target: string): null | string {
+  const folded = target.normalize('NFKC').toLowerCase()
+  const reason = sensitiveFileBlockReason(target) ?? sensitiveFileBlockReason(folded)
 
-  if (sensitive) {
-    refuse('sensitive-file', sensitive)
+  if (reason) {
+    return reason
+  }
+
+  return SENSITIVE_DIRS.has(path.basename(folded)) ? 'That folder holds keys and cannot be used by a plugin.' : null
+}
+
+export const refuseSensitive = (...targets: string[]) => {
+  for (const target of targets) {
+    const reason = sensitiveReason(target)
+
+    if (reason) {
+      refuse('sensitive-file', reason)
+    }
+  }
+}
+
+const sameFile = (a: fs.Stats, b: fs.Stats) => a.dev === b.dev && a.ino === b.ino
+
+// Only a plain, singly-linked file: a FIFO or device has no size to cap, and a
+// hard link may be a second name for a file anywhere on the volume.
+function refuseNonPlain(stat: fs.Stats) {
+  if (!stat.isFile()) {
+    refuse('not-a-file', 'That path is not a regular file.')
+  }
+
+  if (stat.nlink > 1) {
+    refuse('protected', 'That file is hard-linked elsewhere, so the app cannot tell what it belongs to.')
+  }
+}
+
+// Read at most `maxBytes` through a handle that must still be the checked
+// file. The cap counts bytes read, not the size stat reported (0 for a pseudo
+// file), so a file is refused past the cap whatever it claims.
+async function readChecked(resolved: Resolved, maxBytes: number): Promise<Buffer> {
+  const handle = await fs.promises.open(resolved.target, READ_FLAGS)
+
+  try {
+    const opened = await handle.stat()
+
+    if (!sameFile(opened, resolved.stat!)) {
+      refuse('outside-folder', 'The file changed while it was being opened.')
+    }
+
+    refuseNonPlain(opened)
+    const chunks: Buffer[] = []
+    let total = 0
+
+    for (;;) {
+      const chunk = Buffer.alloc(Math.min(READ_CHUNK_BYTES, maxBytes + 1 - total))
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, total)
+
+      if (bytesRead === 0) {
+        return Buffer.concat(chunks, total)
+      }
+
+      chunks.push(chunk.subarray(0, bytesRead))
+      total += bytesRead
+
+      if (total > maxBytes) {
+        return refuse('too-large', `File is larger than ${Math.round(maxBytes / (1024 * 1024))} MiB.`)
+      }
+    }
+  } finally {
+    await handle.close()
+  }
+}
+
+// Write `text` to the checked target: an existing file through a no-follow
+// handle that must be the checked file (and is only truncated after that),
+// a new one created O_EXCL and then confirmed to sit where it was checked.
+async function writeChecked(resolved: Resolved, text: string) {
+  if (resolved.stat) {
+    refuseNonPlain(resolved.stat)
+    const handle = await fs.promises.open(resolved.target, UPDATE_FLAGS)
+
+    try {
+      if (!sameFile(await handle.stat(), resolved.stat)) {
+        refuse('outside-folder', 'The file changed while it was being opened.')
+      }
+
+      await handle.truncate(0)
+      await handle.writeFile(text, 'utf8')
+    } finally {
+      await handle.close()
+    }
+
+    return
+  }
+
+  const handle = await fs.promises.open(resolved.entry, 'wx')
+
+  try {
+    const created = await handle.stat()
+    const real = await realpathOrNull(resolved.entry)
+    const landed = real ? await lstatOrNull(real) : null
+
+    if (real !== resolved.entry || !landed || !sameFile(landed, created)) {
+      if (landed && sameFile(landed, created)) {
+        await fs.promises.unlink(real!)
+      }
+
+      refuse('outside-folder', 'The folder changed while the file was being created.')
+    }
+
+    await handle.writeFile(text, 'utf8')
+  } finally {
+    await handle.close()
   }
 }
 
@@ -88,7 +207,7 @@ export interface Resolved {
   parent: null | string
   /** The entry as named (in the real parent), not following a final link. */
   entry: string
-  /** What reads/writes act on: the entry, or its in-folder link target. */
+  /** What reads/writes act on: the entry's realpath (inside the folder). */
   target: string
   stat: fs.Stats | null
 }
@@ -117,11 +236,13 @@ export function createPluginFileOps({
       refuse('is-directory', 'That path is a folder.')
     }
 
+    refuseNonPlain(resolved.stat!)
+
     if (resolved.stat!.size > maxBytes) {
       refuse('too-large', `File is larger than ${Math.round(maxBytes / (1024 * 1024))} MiB.`)
     }
 
-    refuseSensitive(resolved.target)
+    refuseSensitive(resolved.entry, resolved.target)
   }
 
   const requireChild = (resolved: Resolved) => {
@@ -172,7 +293,7 @@ export function createPluginFileOps({
     async readText(pluginId, req) {
       const resolved = await resolve(pluginId, req.folder, req.path)
       requireFile(resolved, TEXT_MAX_BYTES)
-      const data = await fs.promises.readFile(resolved.target)
+      const data = await readChecked(resolved, TEXT_MAX_BYTES)
 
       if (data.subarray(0, 8000).includes(0)) {
         return fail('binary', 'That file is binary; read it as a data URL.')
@@ -184,7 +305,7 @@ export function createPluginFileOps({
     async readDataUrl(pluginId, req) {
       const resolved = await resolve(pluginId, req.folder, req.path)
       requireFile(resolved, DATA_URL_MAX_BYTES)
-      const data = await fs.promises.readFile(resolved.target)
+      const data = await readChecked(resolved, DATA_URL_MAX_BYTES)
 
       return { ok: true, url: `data:${mimeFor(resolved.target)};base64,${data.toString('base64')}` }
     },
@@ -207,14 +328,8 @@ export function createPluginFileOps({
         return fail('exists', 'A file with that name already exists.')
       }
 
-      refuseSensitive(resolved.target)
-
-      // A new file is created with O_EXCL, which also refuses a link planted
-      // after the check above; an existing one is written at its in-folder target.
-      await fs.promises.writeFile(resolved.stat ? resolved.target : resolved.entry, text, {
-        encoding: 'utf8',
-        flag: resolved.stat ? 'w' : 'wx'
-      })
+      refuseSensitive(resolved.entry, resolved.target)
+      await writeChecked(resolved, text)
       const stat = await fs.promises.stat(resolved.target)
 
       return { ok: true, path: toRel(resolved.parts), size: stat.size, mtimeMs: stat.mtimeMs }
@@ -235,7 +350,7 @@ export function createPluginFileOps({
       }
 
       const destination = path.join(resolved.parent!, name)
-      refuseSensitive(destination)
+      refuseSensitive(resolved.entry, resolved.target, destination)
 
       if (await lstatOrNull(destination)) {
         return fail('exists', `"${name}" already exists.`)
@@ -254,6 +369,7 @@ export function createPluginFileOps({
         return fail('not-found', 'No such file or folder.')
       }
 
+      refuseSensitive(resolved.entry, resolved.target)
       await trashItem(resolved.entry)
 
       return { ok: true }

@@ -12,7 +12,10 @@
 // - nothing may resolve into a protected root (the Hermes homes, which hold
 //   config.yaml, .env, auth and every profile; the app's own data folder,
 //   which holds every plugin's data folder and the grants record), and a
-//   folder overlapping one in either direction can never be granted;
+//   folder overlapping one in either direction (by path, by filesystem
+//   identity, as a WSL home or a loopback share) can never be granted, and
+//   no op reaches a kernel pseudo-filesystem (/proc, /sys, …) by path or by
+//   filesystem type;
 // - reads and writes are size-capped and refused, never truncated, and the
 //   app's sensitive-file rules (.env, SSH/GPG keys, .npmrc…) hold inside a
 //   granted folder too; a key folder (~/.ssh, ~/.gnupg) cannot be granted.
@@ -25,11 +28,21 @@
 // a renderer-realm plugin can still call the raw `window.hermesDesktop` file
 // bridge, which is why catalog admission requires the door instead.
 
-import { createHash, randomBytes } from 'node:crypto'
+import { randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 
-import { sensitiveFileBlockReason } from './hardening'
+import {
+  dataDirName,
+  loopbackShare,
+  onPseudoFilesystem,
+  overlapsByIdentity,
+  pathTools,
+  pluginKey,
+  realRoots,
+  systemRoots,
+  wslProtectedPath
+} from './plugin-files-guards'
 import {
   createPluginFileOps,
   errnoCode,
@@ -38,16 +51,12 @@ import {
   realpathOrNull,
   Refusal,
   refuse,
-  type Resolved
+  type Resolved,
+  sensitiveReason
 } from './plugin-files-ops'
 
 export const PLUGIN_DATA_FOLDER = 'data'
 
-const REL_PATH_MAX = 1024
-const SEGMENT_MAX = 255
-// Plugin ids become a folder name under the shared data root, so only a plain
-// slug may reach the join (no separators, no leading dot, no `..`).
-const PLUGIN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 const GRANT_ID_RE = /^[a-f0-9]{16}$/
 
 export type PluginFilesErrorCode =
@@ -61,6 +70,7 @@ export type PluginFilesErrorCode =
   | 'io-error'
   | 'is-directory'
   | 'not-a-directory'
+  | 'not-a-file'
   | 'not-found'
   | 'not-granted'
   | 'outside-folder'
@@ -109,97 +119,67 @@ export interface PluginFiles {
 }
 
 
-function pathTools(platform: NodeJS.Platform) {
-  const caseless = platform === 'win32' || platform === 'darwin'
-  const fold = (value: string) => (caseless ? value.toLowerCase() : value)
-
-  const inside = (child: string, parent: string): boolean => {
-    const rel = path.relative(fold(parent), fold(child))
-
-    return rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel))
-  }
-
-  const same = (a: string, b: string) => fold(path.resolve(a)) === fold(path.resolve(b))
-
-  // Split a plugin-supplied relative path into plain segments, refusing (not
-  // normalizing) anything that could name a place outside the folder.
-  const segments = (raw: unknown): string[] => {
-    if (typeof raw !== 'string' || raw.length > REL_PATH_MAX || raw.includes('\0')) {
-      return refuse('invalid-path', 'Path must be a relative path inside the folder.')
-    }
-
-    if (path.posix.isAbsolute(raw) || path.win32.isAbsolute(raw) || /^[a-zA-Z]:/.test(raw)) {
-      return refuse('invalid-path', 'Path must be relative to the folder, not absolute.')
-    }
-
-    const parts = raw.split(/[\\/]+/).filter(part => part && part !== '.')
-
-    for (const part of parts) {
-      if (part === '..' || part.length > SEGMENT_MAX) {
-        return refuse('invalid-path', 'Path may not leave the folder.')
-      }
-
-      // Windows drops trailing dots/spaces (`.. ` is `..`) and reads `:` as a stream.
-      if (platform === 'win32' && (part.includes(':') || /[. ]$/.test(part))) {
-        return refuse('invalid-path', 'Path segment is not valid on Windows.')
-      }
-    }
-
-    return parts
-  }
-
-  return { inside, same, segments }
-}
-
-async function realRoots(roots: string[]): Promise<string[]> {
-  const resolved = await Promise.all(
-    roots.filter(Boolean).map(async root => (await realpathOrNull(root)) ?? path.resolve(root))
-  )
-
-  return [...new Set(resolved)]
-}
-
-// Case-insensitive filesystems would give `Plexus` and `plexus` one folder; an
-// id with capitals gets a suffix (`~` never appears in an id) to keep them apart.
-function dataDirName(pluginId: string): string {
-  return pluginId === pluginId.toLowerCase()
-    ? pluginId
-    : `${pluginId.toLowerCase()}~${createHash('sha256').update(pluginId).digest('hex').slice(0, 8)}`
-}
-
 export function createPluginFiles(deps: PluginFilesDeps): PluginFiles {
   const platform = deps.platform ?? process.platform
-  const { inside, same, segments } = pathTools(platform)
+  const { inside, insideLoose, same, segments } = pathTools(platform)
   const baseDir = () => path.join(deps.userDataDir(), 'plugin-files')
   const storeFile = () => path.join(baseDir(), 'grants.json')
 
-  let store: null | Record<string, PluginFolderGrant[]> = null
+  type Store = Record<string, PluginFolderGrant[]>
+  let store: null | Store = null
+  let loading: null | Promise<Store> = null
   let writes: Promise<unknown> = Promise.resolve()
 
-  const load = async (): Promise<Record<string, PluginFolderGrant[]>> => {
+  // Null prototype: a plugin id such as `constructor` is just a key.
+  const fresh = (grants: unknown): Store =>
+    Object.assign(Object.create(null), grants && typeof grants === 'object' ? grants : {})
+
+  const readStore = async (): Promise<Store> => {
+    // A missing or unreadable-as-JSON record is no grants (fail closed). Any
+    // other read error is thrown, so a later write never replaces a record
+    // it could not read.
+    const raw = await fs.promises.readFile(storeFile(), 'utf8').catch(error => {
+      if (errnoCode(error) === 'ENOENT') {
+        return '{}'
+      }
+
+      throw error
+    })
+
+    try {
+      return fresh((JSON.parse(raw) as { grants?: unknown } | null)?.grants)
+    } catch {
+      return fresh(null)
+    }
+  }
+
+  // One initial read, shared; a read finishing late never replaces a record
+  // a write already published.
+  const load = async (): Promise<Store> => {
     if (store) {
       return store
     }
 
-    try {
-      const parsed = JSON.parse(await fs.promises.readFile(storeFile(), 'utf8'))
-      store = parsed && typeof parsed.grants === 'object' && parsed.grants ? parsed.grants : {}
-    } catch {
-      store = {}
-    }
+    loading ??= readStore().finally(() => {
+      loading = null
+    })
+    const read = await loading
+    store ??= read
 
-    return store!
+    return store
   }
 
-  // Serialized read-modify-write; tmp + rename so a crash never leaves half a record.
-  const mutate = <T>(change: (grants: Record<string, PluginFolderGrant[]>) => T): Promise<T> => {
+  // Serialized read-modify-write on a copy, saved with tmp + rename, and only
+  // published once saved: a failed save changes nothing, now or after restart.
+  const mutate = <T>(change: (grants: Store) => T): Promise<T> => {
     const next = writes.then(async () => {
-      const grants = await load()
+      const grants = fresh(structuredClone({ ...(await load()) }))
       const result = change(grants)
       await fs.promises.mkdir(baseDir(), { recursive: true })
       const tmp = `${storeFile()}.${process.pid}.tmp`
       await fs.promises.writeFile(tmp, JSON.stringify({ version: 1, grants }, null, 2), { mode: 0o600 })
       await fs.promises.rename(tmp, storeFile())
+      store = grants
 
       return result
     })
@@ -209,15 +189,22 @@ export function createPluginFiles(deps: PluginFilesDeps): PluginFiles {
     return next
   }
 
-  const protectedRoots = async (): Promise<string[]> => realRoots([...deps.protectedRoots(), deps.userDataDir()])
+  const protectedRoots = async (): Promise<string[]> =>
+    realRoots([...deps.protectedRoots(), deps.userDataDir(), ...systemRoots(platform)])
+
+  // A second spelling of this machine's files that no realpath comparison can
+  // match: a WSL share or a loopback/device path on Windows.
+  const secondPath = (real: string) => platform === 'win32' && (wslProtectedPath(real) || loopbackShare(real))
+
+  // Kernel pseudo-filesystems by type, so one mounted anywhere is refused.
+  const refusePseudo = async (real: string) => {
+    if (platform === 'linux' && (await onPseudoFilesystem(real))) {
+      refuse('protected', 'That is a kernel filesystem and cannot be used by a plugin.')
+    }
+  }
 
   const overlapsProtected = (real: string, roots: string[]) =>
-    roots.some(root => inside(real, root) || inside(root, real))
-
-  const pluginKey = (pluginId: unknown): string =>
-    typeof pluginId === 'string' && PLUGIN_ID_RE.test(pluginId)
-      ? pluginId
-      : refuse('invalid-plugin', 'Plugin id is not a plain slug.')
+    roots.some(root => insideLoose(real, root) || insideLoose(root, real)) || secondPath(real)
 
   // The folder a handle names, as a realpath, plus the protected roots an op
   // inside it must still avoid (none for the plugin's own data folder, whose
@@ -259,6 +246,8 @@ export function createPluginFiles(deps: PluginFilesDeps): PluginFiles {
       return refuse('protected', 'That folder overlaps Hermes data and cannot be used by a plugin.')
     }
 
+    await refusePseudo(real)
+
     return { root: real, avoid }
   }
 
@@ -271,7 +260,7 @@ export function createPluginFiles(deps: PluginFilesDeps): PluginFiles {
         refuse('outside-folder', 'That path leaves the folder.')
       }
 
-      if (avoid.some(protectedRoot => inside(real, protectedRoot))) {
+      if (avoid.some(protectedRoot => insideLoose(real, protectedRoot)) || secondPath(real)) {
         refuse('protected', 'That path is Hermes data and cannot be used by a plugin.')
       }
     }
@@ -290,20 +279,23 @@ export function createPluginFiles(deps: PluginFilesDeps): PluginFiles {
 
     const entry = path.join(parent, parts[parts.length - 1])
     const lstat = await lstatOrNull(entry)
-    let target = entry
 
-    if (lstat?.isSymbolicLink()) {
-      const real = await realpathOrNull(entry)
-
-      if (!real) {
-        return refuse('outside-folder', 'That link points nowhere inside the folder.')
-      }
-
-      guard(real)
-      target = real
+    if (!lstat) {
+      return { root, parts, parent, entry, target: entry, stat: null }
     }
 
-    return { root, parts, parent, entry, target, stat: lstat ? await fs.promises.stat(target) : null }
+    // Every existing entry is checked by its realpath: a symlink's target, and
+    // the long, correctly-cased name behind a Windows short name (`ENV~1`).
+    const target = await realpathOrNull(entry)
+
+    if (!target) {
+      return refuse('outside-folder', 'That link points nowhere inside the folder.')
+    }
+
+    guard(target)
+    await refusePseudo(target)
+
+    return { root, parts, parent, entry, target, stat: await fs.promises.stat(target) }
   }
 
   const OPS = createPluginFileOps({ resolve, inside, segments, trashItem: deps.trashItem })
@@ -342,11 +334,15 @@ export function createPluginFiles(deps: PluginFilesDeps): PluginFiles {
           return fail('not-a-directory', 'Pick a folder.')
         }
 
-        if (overlapsProtected(real, await protectedRoots())) {
+        const roots = await protectedRoots()
+
+        if (overlapsProtected(real, roots) || (await overlapsByIdentity(real, roots))) {
           return fail('protected', 'That folder holds Hermes data and cannot be shared with a plugin.')
         }
 
-        if (sensitiveFileBlockReason(path.join(real, 'entry'))) {
+        await refusePseudo(real)
+
+        if (sensitiveReason(path.join(real, 'entry')) || sensitiveReason(real)) {
           return fail('protected', 'That folder holds keys or credentials and cannot be shared with a plugin.')
         }
 
