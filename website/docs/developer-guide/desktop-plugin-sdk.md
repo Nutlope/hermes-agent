@@ -1402,8 +1402,13 @@ app's main process checks each call: `..`, absolute paths, drive letters and
 symlinks that resolve outside the folder are refused, never normalized, and
 nothing inside Hermes' own data (the Hermes home with `config.yaml`, `.env`,
 auth and profiles; the app data folder with every plugin's data and the grants
-record) is reachable. A folder that holds or sits inside Hermes data, or a key
-folder such as `~/.ssh`, cannot be granted at all; the app tells the user why.
+record) is reachable. A folder that holds or sits inside Hermes data (however
+it is spelled: a bind mount, a macOS firmlink, a WSL share or a
+`\\localhost\C$` share counts), a key folder such as `~/.ssh`, or a kernel
+filesystem such as `/proc` (wherever it is mounted) cannot be granted at all;
+the app tells the user why. Only plain files are read or written: a pipe, a
+device or a hard-linked file is refused, and a file swapped for a link between
+the app's check and its open is refused rather than followed.
 
 ```ts
 // First run: ask once, remember the handle.
@@ -1425,13 +1430,18 @@ await ctx.files.writeText('data', 'index.json', JSON.stringify(index))
 await ctx.files.release(vault.id)                              // give the folder back
 ```
 
-Every member resolves `{ ok: true, … }` or `{ ok: false, error, message }` and
-never throws. `error` is one of `invalid-path`, `outside-folder`, `protected`,
+No member throws. `dataFolder` is the string `'data'`; `folders()` resolves
+an array of `{ id, name, path }` (empty when the app has no door);
+`release(id)` resolves `true` when it gave a folder back and `false`
+otherwise. Every other member resolves `{ ok: true, … }` or
+`{ ok: false, error, message }`, where `error` is one of `invalid-path`, `outside-folder`, `protected`,
 `not-granted` (revoked, or another plugin's folder), `folder-missing`,
 `folder-changed` (the granted folder was moved or replaced: ask again),
-`not-found`, `exists`, `is-directory`, `not-a-directory`, `binary`,
-`too-large`, `sensitive-file` (`.env`, SSH keys and similar are refused even
-inside a granted folder), `io-error`, or `unavailable` (an app build without
+`not-found`, `exists`, `is-directory`, `not-a-directory`, `not-a-file`,
+`binary`, `too-large`, `sensitive-file` (`.env`, SSH keys and similar are
+refused even inside a granted folder, under any spelling the OS treats as the
+same name, and cannot be renamed or trashed),
+`io-error`, or `unavailable` (an app build without
 the door: feature-detect with `ctx.files?.…`). Limits: text reads and writes up
 to 4 MiB, data URLs up to 16 MiB, listings up to 10,000 entries. Reads are
 refused past the limit, never truncated. A write needs its parent folder to
