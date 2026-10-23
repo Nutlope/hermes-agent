@@ -50,7 +50,7 @@
     "@vitejs/plugin-react": "6.0.3",
     "babel-plugin-react-compiler": "1.0.0",
     "eslint-plugin-react-refresh": "0.5.7",
-    "three": "0.180.0",
+    "three": "0.186.1",
     "typescript": "6.0.3",
     "vite": "8.2.4",
     "vitest": "4.1.12"
