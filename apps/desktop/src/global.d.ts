@@ -512,6 +512,8 @@ declare global {
         grants: (pluginId: string) => Promise<HermesPluginFolderGrant[]>
         revoke: (pluginId: string, folderId?: string) => Promise<{ ok: true; removed: number }>
         op: (pluginId: string, request: Record<string, unknown>) => Promise<HermesPluginFilesResult>
+        /** A grant was added or revoked in any window; returns an unsubscribe. */
+        onChanged?: (callback: (change: { pluginId: string }) => void) => () => void
       }
       // Git-driven worktree management for the "Start work" flow.
       git?: {

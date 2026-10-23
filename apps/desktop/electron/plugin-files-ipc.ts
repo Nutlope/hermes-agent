@@ -21,6 +21,8 @@ export interface PluginFilesIpcDeps extends Omit<PluginFilesDeps, 'protectedRoot
   ipcMain: Pick<IpcMain, 'handle'>
   dialog: Pick<Dialog, 'showOpenDialog'>
   windowFor: (event: IpcMainInvokeEvent) => BrowserWindow | null
+  /** Tell every app window a plugin's grants changed (Folder access lists). */
+  broadcastChange: (change: { pluginId: string }) => void
   /** The resolved HERMES_HOME plus the platform-default homes it may differ from. */
   hermesHomes: () => string[]
 }
@@ -48,15 +50,27 @@ export function registerPluginFilesIpc(deps: PluginFilesIpcDeps): PluginFiles {
         return { ok: true, folder: null }
       }
 
-      return files.addGrant(pluginId, path.resolve(picked.filePaths[0]))
+      const granted = await files.addGrant(pluginId, path.resolve(picked.filePaths[0]))
+
+      if (granted.ok) {
+        deps.broadcastChange({ pluginId: String(pluginId) })
+      }
+
+      return granted
     }
   )
 
   deps.ipcMain.handle('hermes:pluginFiles:grants', async (_event, pluginId: unknown) => files.grants(pluginId))
 
-  deps.ipcMain.handle('hermes:pluginFiles:revoke', async (_event, pluginId: unknown, folderId?: unknown) =>
-    files.revoke(pluginId, folderId)
-  )
+  deps.ipcMain.handle('hermes:pluginFiles:revoke', async (_event, pluginId: unknown, folderId?: unknown) => {
+    const revoked = await files.revoke(pluginId, folderId)
+
+    if (revoked.removed) {
+      deps.broadcastChange({ pluginId: String(pluginId) })
+    }
+
+    return revoked
+  })
 
   deps.ipcMain.handle('hermes:pluginFiles:op', async (_event, pluginId: unknown, request) =>
     files.run(pluginId, request)

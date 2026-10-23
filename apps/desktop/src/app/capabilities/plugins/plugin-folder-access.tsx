@@ -1,4 +1,5 @@
 import { useQuery } from '@tanstack/react-query'
+import { useEffect } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
@@ -30,6 +31,17 @@ export function PluginFolderAccess({ plugin, name }: PluginFolderAccessProps) {
     queryFn: () => door!.grants(pluginId),
     queryKey: grantsKey(pluginId)
   })
+
+  // A grant made or revoked in another window refreshes this list too.
+  useEffect(
+    () =>
+      door?.onChanged?.(change => {
+        if (change.pluginId === pluginId) {
+          void queryClient.invalidateQueries({ queryKey: grantsKey(pluginId) })
+        }
+      }),
+    [door, pluginId]
+  )
 
   if (!grants.length) {
     return null

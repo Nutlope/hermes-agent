@@ -47,6 +47,12 @@ export function registerFsIpc({
     ipcMain,
     dialog,
     windowFor: event => BrowserWindow.fromWebContents(event.sender),
+    // App windows only: preview guests and webviews never hear about grants.
+    broadcastChange: change => {
+      for (const window of BrowserWindow.getAllWindows()) {
+        window.webContents.send('hermes:pluginFiles:changed', change)
+      }
+    },
     userDataDir: () => app.getPath('userData'),
     hermesHomes: () => [
       hermesHome,
